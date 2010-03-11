@@ -81,6 +81,8 @@ class IOLoop(object):
 
     def __init__(self, impl=None):
         self._impl = impl or _poll()
+        if hasattr(self._impl, 'fileno'):
+            self._set_close_exec(self._impl.fileno())
         self._handlers = {}
         self._events = {}
         self._callbacks = set()
@@ -93,9 +95,11 @@ class IOLoop(object):
         r, w = os.pipe()
         self._set_nonblocking(r)
         self._set_nonblocking(w)
+        self._set_close_exec(r)
+        self._set_close_exec(w)
         self._waker_reader = os.fdopen(r, "r", 0)
         self._waker_writer = os.fdopen(w, "w", 0)
-        self.add_handler(r, self._read_waker, self.WRITE)
+        self.add_handler(r, self._read_waker, self.READ)
 
     @classmethod
     def instance(cls):
@@ -195,7 +199,7 @@ class IOLoop(object):
                 fd, events = self._events.popitem()
                 try:
                     self._handlers[fd](fd, events)
-                except KeyboardInterrupt:
+                except (KeyboardInterrupt, SystemExit):
                     raise
                 except (OSError, IOError), e:
                     if e[0] == errno.EPIPE:
@@ -261,7 +265,19 @@ class IOLoop(object):
         except (KeyboardInterrupt, SystemExit):
             raise
         except:
-            logging.error("Exception in callback %r", callback, exc_info=True)
+            self.handle_callback_exception(callback)
+
+    def handle_callback_exception(self, callback):
+        """This method is called whenever a callback run by the IOLoop
+        throws an exception.
+
+        By default simply logs the exception as an error.  Subclasses
+        may override this method to customize reporting of exceptions.
+
+        The exception itself is not passed explicitly, but is available
+        in sys.exc_info.
+        """
+        logging.error("Exception in callback %r", callback, exc_info=True)
 
     def _read_waker(self, fd, events):
         try:
@@ -273,6 +289,10 @@ class IOLoop(object):
     def _set_nonblocking(self, fd):
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def _set_close_exec(self, fd):
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
 
 
 class _Timeout(object):
@@ -308,6 +328,8 @@ class PeriodicCallback(object):
         if not self._running: return
         try:
             self.callback()
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except:
             logging.error("Error in periodic callback", exc_info=True)
         self.start()
@@ -321,6 +343,9 @@ class _EPoll(object):
 
     def __init__(self):
         self._epoll_fd = epoll.epoll_create()
+
+    def fileno(self):
+        return self._epoll_fd
 
     def register(self, fd, events):
         epoll.epoll_ctl(self._epoll_fd, self._EPOLL_CTL_ADD, fd, events)
@@ -339,41 +364,50 @@ class _KQueue(object):
     """A kqueue-based event loop for BSD/Mac systems."""
     def __init__(self):
         self._kqueue = select.kqueue()
-        self._filters = {}
+        self._active = {}
+
+    def fileno(self):
+        return self._kqueue.fileno()
 
     def register(self, fd, events):
-        filter = 0
-        if events & IOLoop.WRITE:
-            filter |= select.KQ_FILTER_WRITE
-        if events & IOLoop.READ or filter == 0:
-            filter |= select.KQ_FILTER_READ
-        self._filters[fd] = filter
-        kevent = select.kevent(fd, filter=filter)
-        self._kqueue.control([kevent], 0)
+        self._control(fd, events, select.KQ_EV_ADD)
+        self._active[fd] = events
 
     def modify(self, fd, events):
         self.unregister(fd)
         self.register(fd, events)
 
     def unregister(self, fd):
-        kevent = select.kevent(fd, filter=self._filters[fd],
-                               flags=select.KQ_EV_DELETE)
-        self._kqueue.control([kevent], 0)
+        events = self._active.pop(fd)
+        self._control(fd, events, select.KQ_EV_DELETE)
+
+    def _control(self, fd, events, flags):
+        kevents = []
+        if events & IOLoop.WRITE:
+            kevents.append(select.kevent(
+                    fd, filter=select.KQ_FILTER_WRITE, flags=flags))
+        if events & IOLoop.READ or not kevents:
+            # Always read when there is not a write
+            kevents.append(select.kevent(
+                    fd, filter=select.KQ_FILTER_READ, flags=flags))
+        # Even though control() takes a list, it seems to return EINVAL
+        # on Mac OS X (10.6) when there is more than one event in the list.
+        for kevent in kevents:
+            self._kqueue.control([kevent], 0)
 
     def poll(self, timeout):
         kevents = self._kqueue.control(None, 1000, timeout)
-        events = []
+        events = {}
         for kevent in kevents:
             fd = kevent.ident
             flags = 0
-            if kevent.filter & select.KQ_FILTER_READ:
-                flags |= IOLoop.READ
-            if kevent.filter & select.KQ_FILTER_WRITE:
-                flags |= IOLoop.WRITE
+            if kevent.filter == select.KQ_FILTER_READ:
+                events[fd] = events.get(fd, 0) | IOLoop.READ
+            if kevent.filter == select.KQ_FILTER_WRITE:
+                events[fd] = events.get(fd, 0) | IOLoop.WRITE
             if kevent.flags & select.KQ_EV_ERROR:
-                flags |= IOLoop.ERROR
-            events.append((fd, flags))
-        return events
+                events[fd] = events.get(fd, 0) | IOLoop.ERROR
+        return events.items()
 
 
 class _Select(object):
