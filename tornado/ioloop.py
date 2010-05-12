@@ -99,6 +99,7 @@ class IOLoop(object):
         self._handlers = {}
         self._events = {}
         self._callbacks = set()
+        self._persistent_callbacks = set()
         self._timeouts = []
         self._running = False
         self._stopped = False
@@ -178,7 +179,7 @@ class IOLoop(object):
                      self._blocking_log_threshold,
                      ''.join(traceback.format_stack(frame)))
 
-    def start(self):
+    def start(self, start_poll_timeout = 0.2):
         """Starts the I/O loop.
 
         The loop will run until one of the I/O handlers calls stop(), which
@@ -190,7 +191,7 @@ class IOLoop(object):
         self._running = True
         while True:
             # Never use an infinite timeout here - it can stall epoll
-            poll_timeout = 0.2
+            poll_timeout = start_poll_timeout
 
             # Prevent IO event starvation by delaying new callbacks
             # to the next iteration of the event loop.
@@ -200,6 +201,10 @@ class IOLoop(object):
                 if callback in self._callbacks:
                     self._callbacks.remove(callback)
                     self._run_callback(callback)
+
+            #start persisten callbacks
+            for callback in self._persistent_callbacks:
+                self._run_callback(callback)
 
             if self._callbacks:
                 poll_timeout = 0.0
@@ -290,14 +295,20 @@ class IOLoop(object):
     def remove_timeout(self, timeout):
         self._timeouts.remove(timeout)
 
-    def add_callback(self, callback):
+    def add_callback(self, callback, persistent = False):
         """Calls the given callback on the next I/O loop iteration."""
-        self._callbacks.add(callback)
+        if persistent:
+            self._persistent_callbacks.add(callback)
+        else:
+            self._callbacks.add(callback)
         self._wake()
 
     def remove_callback(self, callback):
         """Removes the given callback from the next I/O loop iteration."""
-        self._callbacks.remove(callback)
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+        if callback in self._persistent_callbacks:
+            self._persistent_callbacks.remove(callback)
 
     def _wake(self):
         try:
