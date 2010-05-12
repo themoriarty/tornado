@@ -70,7 +70,6 @@ import urllib
 import urlparse
 import uuid
 
-
 class RequestHandler(object):
     """Subclass this class and define get() or post() to make a handler.
 
@@ -216,8 +215,14 @@ class RequestHandler(object):
         return default
 
     def set_cookie(self, name, value, domain=None, expires=None, path="/",
-                   expires_days=None):
-        """Sets the given cookie name/value with the given options."""
+                   expires_days=None, **kwargs):
+        """Sets the given cookie name/value with the given options.
+
+        Additional keyword arguments are set on the Cookie.Morsel
+        directly.
+        See http://docs.python.org/library/cookie.html#morsel-objects
+        for available attributes.
+        """
         name = _utf8(name)
         value = _utf8(value)
         if re.search(r"[\x00-\x20]", name + value):
@@ -239,6 +244,8 @@ class RequestHandler(object):
                 timestamp, localtime=False, usegmt=True)
         if path:
             new_cookie[name]["path"] = path
+        for k, v in kwargs.iteritems():
+            new_cookie[name][k] = v
 
     def clear_cookie(self, name, path="/", domain=None):
         """Deletes the cookie with the given name."""
@@ -338,6 +345,7 @@ class RequestHandler(object):
         css_embed = []
         css_files = []
         html_heads = []
+        html_bodies = []
         for module in getattr(self, "_active_modules", {}).itervalues():
             embed_part = module.embedded_javascript()
             if embed_part: js_embed.append(_utf8(embed_part))
@@ -357,6 +365,8 @@ class RequestHandler(object):
                     css_files.extend(file_part)
             head_part = module.html_head()
             if head_part: html_heads.append(_utf8(head_part))
+            body_part = module.html_body()
+            if body_part: html_bodies.append(_utf8(body_part))
         if js_files:
             # Maintain order of JavaScript files given by modules
             paths = []
@@ -397,7 +407,9 @@ class RequestHandler(object):
         if html_heads:
             hloc = html.index('</head>')
             html = html[:hloc] + ''.join(html_heads) + '\n' + html[hloc:]
-
+        if html_bodies:
+            hloc = html.index('</body>')
+            html = html[:hloc] + ''.join(html_bodies) + '\n' + html[hloc:]
         self.finish(html)
 
     def render_string(self, template_name, **kwargs):
@@ -417,8 +429,9 @@ class RequestHandler(object):
         if not getattr(RequestHandler, "_templates", None):
             RequestHandler._templates = {}
         if template_path not in RequestHandler._templates:
-            RequestHandler._templates[template_path] = template.Loader(
-                template_path)
+            loader = self.application.settings.get("template_loader") or\
+              template.Loader(template_path)
+            RequestHandler._templates[template_path] = loader
         t = RequestHandler._templates[template_path].load(template_name)
         args = dict(
             handler=self,
@@ -468,7 +481,8 @@ class RequestHandler(object):
         # Automatically support ETags and add the Content-Length header if
         # we have not flushed any content yet.
         if not self._headers_written:
-            if self._status_code == 200 and self.request.method == "GET":
+            if (self._status_code == 200 and self.request.method == "GET" and
+                "Etag" not in self._headers):
                 hasher = hashlib.sha1()
                 for part in self._write_buffer:
                     hasher.update(part)
@@ -931,7 +945,15 @@ class Application(object):
         if not host_pattern.endswith("$"):
             host_pattern += "$"
         handlers = []
-        self.handlers.append((re.compile(host_pattern), handlers))
+        # The handlers with the wildcard host_pattern are a special
+        # case - they're added in the constructor but should have lower
+        # precedence than the more-precise handlers added later.
+        # If a wildcard handler group exists, it should always be last
+        # in the list, so insert new groups just before it.
+        if self.handlers and self.handlers[-1][0].pattern == '.*$':
+            self.handlers.insert(-1, (re.compile(host_pattern), handlers))
+        else:
+            self.handlers.append((re.compile(host_pattern), handlers))
 
         for spec in host_handlers:
             if type(spec) is type(()):
@@ -945,6 +967,10 @@ class Application(object):
                 spec = URLSpec(pattern, handler, kwargs)
             handlers.append(spec)
             if spec.name:
+                if spec.name in self.named_handlers:
+                    logging.warning(
+                        "Multiple handlers named %s; replacing previous value",
+                        spec.name)
                 self.named_handlers[spec.name] = spec
 
     def add_transform(self, transform_class):
@@ -995,6 +1021,7 @@ class Application(object):
         transforms = [t(request) for t in self.transforms]
         handler = None
         args = []
+        kwargs = {}
         handlers = self._get_host_handlers(request)
         if not handlers:
             handler = RedirectHandler(
@@ -1004,7 +1031,14 @@ class Application(object):
                 match = spec.regex.match(request.path)
                 if match:
                     handler = spec.handler_class(self, request, **spec.kwargs)
-                    args = match.groups()
+                    # Pass matched groups to the handler.  Since
+                    # match.groups() includes both named and unnamed groups,
+                    # we want to use either groups or groupdict but not both.
+                    kwargs = match.groupdict()
+                    if kwargs:
+                        args = []
+                    else:
+                        args = match.groups()
                     break
             if not handler:
                 handler = ErrorHandler(self, request, 404)
@@ -1012,10 +1046,12 @@ class Application(object):
         # In debug mode, re-compile templates and reload static files on every
         # request so you don't need to restart to see changes
         if self.settings.get("debug"):
-            RequestHandler._templates = None
+            if getattr(RequestHandler, "_templates", None):
+              map(lambda loader: loader.reset(),
+                  RequestHandler._templates.values())
             RequestHandler._static_hashes = {}
 
-        handler._execute(transforms, *args)
+        handler._execute(transforms, *args, **kwargs)
         return handler
 
     def reverse_url(self, name, *args):
@@ -1092,7 +1128,7 @@ class StaticFileHandler(RequestHandler):
     """
     def __init__(self, application, request, path):
         RequestHandler.__init__(self, application, request)
-        self.root = os.path.abspath(path) + "/"
+        self.root = os.path.abspath(path) + os.path.sep
 
     def head(self, path):
         self.get(path, include_body=False)
@@ -1133,7 +1169,7 @@ class StaticFileHandler(RequestHandler):
         if not include_body:
             return
         self.set_header("Content-Length", stat_result[stat.ST_SIZE])
-        file = open(abspath, "r")
+        file = open(abspath, "rb")
         try:
             self.write(file.read())
         finally:
@@ -1301,11 +1337,15 @@ class UIModule(object):
         return None
 
     def css_files(self):
-        """Returns a list of JavaScript files required by this module."""
+        """Returns a list of CSS files required by this module."""
         return None
 
     def html_head(self):
         """Returns a CSS string that will be put in the <head/> element"""
+        return None
+
+    def html_body(self):
+        """Returns an HTML string that will be put in the <body/> element"""
         return None
 
     def render_string(self, path, **kwargs):

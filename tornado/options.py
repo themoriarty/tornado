@@ -49,6 +49,7 @@ for define() below.
 """
 
 import datetime
+import logging
 import logging.handlers
 import re
 import sys
@@ -174,7 +175,7 @@ class _Options(dict):
     def __getattr__(self, name):
         if isinstance(self.get(name), _Option):
             return self[name].value()
-        raise Error("Unrecognized option %r" % name)
+        raise AttributeError("Unrecognized option %r" % name)
 
 
 class _Option(object):
@@ -310,7 +311,8 @@ def enable_pretty_logging():
         if curses and sys.stderr.isatty():
             try:
                 curses.setupterm()
-                color = True
+                if curses.tigetnum("colors") > 0:
+                    color = True
             except:
                 pass
         channel = logging.StreamHandler()

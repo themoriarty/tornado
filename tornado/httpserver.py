@@ -18,7 +18,6 @@
 
 import cgi
 import errno
-import fcntl
 import functools
 import ioloop
 import iostream
@@ -29,10 +28,17 @@ import time
 import urlparse
 
 try:
+    import fcntl
+except ImportError:
+    if os.name == 'nt':
+        import win32_support as fcntl
+    else:
+        raise
+
+try:
     import ssl # Python 2.6+
 except ImportError:
     ssl = None
-
 
 class HTTPServer(object):
     """A non-blocking, single-threaded HTTP server.
@@ -437,6 +443,6 @@ class HTTPHeaders(dict):
         headers = cls()
         for line in headers_string.splitlines():
             if line:
-                name, value = line.split(": ", 1)
-                headers[name] = value
+                name, value = line.split(":", 1)
+                headers[name] = value.strip()
         return headers

@@ -21,6 +21,7 @@ import collections
 import cStringIO
 import email.utils
 import errno
+import escape
 import functools
 import httplib
 import ioloop
@@ -28,7 +29,6 @@ import logging
 import pycurl
 import time
 import weakref
-
 
 class HTTPClient(object):
     """A blocking HTTP client backed with pycurl.
@@ -121,8 +121,21 @@ class AsyncHTTPClient(object):
             instance._events = {}
             instance._added_perform_callback = False
             instance._timeout = None
+            instance._closed = False
             cls._ASYNC_CLIENTS[io_loop] = instance
             return instance
+
+    def close(self):
+        """Destroys this http client, freeing any file descriptors used.
+        Not needed in normal use, but may be helpful in unittests that
+        create and destroy http clients.  No other methods may be called
+        on the AsyncHTTPClient after close().
+        """
+        del AsyncHTTPClient._ASYNC_CLIENTS[self.io_loop]
+        for curl in self._curls:
+            curl.close()
+        self._multi.close()
+        self._closed = True
 
     def fetch(self, request, callback, **kwargs):
         """Executes an HTTPRequest, calling callback with an HTTPResponse.
@@ -152,6 +165,9 @@ class AsyncHTTPClient(object):
 
     def _perform(self):
         self._added_perform_callback = False
+
+        if self._closed:
+            return
 
         while True:
             while True:
@@ -262,7 +278,7 @@ class HTTPRequest(object):
                  if_modified_since=None, follow_redirects=True,
                  max_redirects=5, user_agent=None, use_gzip=True,
                  network_interface=None, streaming_callback=None,
-                 prepare_curl_callback=None):
+                 header_callback=None, prepare_curl_callback=None):
         if if_modified_since:
             timestamp = calendar.timegm(if_modified_since.utctimetuple())
             headers["If-Modified-Since"] = email.utils.formatdate(
@@ -283,6 +299,7 @@ class HTTPRequest(object):
         self.use_gzip = use_gzip
         self.network_interface = network_interface
         self.streaming_callback = streaming_callback
+        self.header_callback = header_callback
         self.prepare_curl_callback = prepare_curl_callback
 
 
@@ -342,8 +359,11 @@ def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.HTTPHEADER,
                 ["%s: %s" % i for i in request.headers.iteritems()])
     try:
-        curl.setopt(pycurl.HEADERFUNCTION,
-                    functools.partial(_curl_header_callback, headers))
+        if request.header_callback:
+            curl.setopt(pycurl.HEADERFUNCTION, request.header_callback)
+        else:
+            curl.setopt(pycurl.HEADERFUNCTION,
+                        functools.partial(_curl_header_callback, headers))
     except:
         # Old version of curl; response will not include headers
         pass
@@ -387,7 +407,7 @@ def _curl_setup_request(curl, request, buffer, headers):
 
     # Handle curl's cryptic options for every individual HTTP method
     if request.method in ("POST", "PUT"):
-        request_buffer =  cStringIO.StringIO(request.body)
+        request_buffer =  cStringIO.StringIO(escape.utf8(request.body))
         curl.setopt(pycurl.READFUNCTION, request_buffer.read)
         if request.method == "POST":
             def ioctl(cmd):
@@ -417,11 +437,16 @@ def _curl_header_callback(headers, header_line):
         return
     if header_line == "\r\n":
         return
-    parts = header_line.split(": ")
+    parts = header_line.split(":", 1)
     if len(parts) != 2:
         logging.warning("Invalid HTTP response header line %r", header_line)
         return
-    headers[parts[0].strip()] = parts[1].strip()
+    name = parts[0].strip()
+    value = parts[1].strip()
+    if name in headers:
+        headers[name] = headers[name] + ',' + value
+    else:
+        headers[name] = value
 
 
 def _curl_debug(debug_type, debug_msg):
