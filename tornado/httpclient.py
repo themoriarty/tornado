@@ -67,13 +67,13 @@ class HTTPClient(object):
             if code < 200 or code >= 300:
                 raise HTTPError(code)
             effective_url = self._curl.getinfo(pycurl.EFFECTIVE_URL)
+            buffer.seek(0)
             return HTTPResponse(
                 request=request, code=code, headers=headers,
-                body=buffer.getvalue(), effective_url=effective_url)
+                buffer=buffer, effective_url=effective_url)
         except pycurl.error, e:
-            raise CurlError(*e)
-        finally:
             buffer.close()
+            raise CurlError(*e)
 
 
 class AsyncHTTPClient(object):
@@ -226,6 +226,25 @@ class AsyncHTTPClient(object):
         for fd in exceptable:
             fds[fd] = fds.get(fd, 0) | 0x8 | 0x10
 
+        if fds and max(fds.iterkeys()) > 900:
+            # Libcurl has a bug in which it behaves unpredictably with
+            # file descriptors greater than 1024.  (This is because
+            # even though it uses poll() instead of select(), it still
+            # uses FD_SET internally) Since curl opens its own file
+            # descriptors we can't catch this problem when it happens,
+            # and the best we can do is detect that it's about to
+            # happen.  Exiting is a lousy way to handle this error,
+            # but there's not much we can do at this point.  Exiting
+            # (and getting restarted by whatever monitoring process
+            # is handling crashed tornado processes) will at least
+            # get things working again and hopefully bring the issue
+            # to someone's attention.
+            # If you run into this issue, you either have a file descriptor
+            # leak or need to run more tornado processes (so that none
+            # of them are handling more than 1000 simultaneous connections)
+            print >> sys.stderr, "ERROR: File descriptor too high for libcurl. Exiting."
+            sys.exit(1)
+
         for fd in self._fds:
             if fd not in fds:
                 try:
@@ -254,20 +273,22 @@ class AsyncHTTPClient(object):
         curl.info = None
         self._multi.remove_handle(curl)
         self._free_list.append(curl)
+        buffer = info["buffer"]
         if curl_error:
             error = CurlError(curl_error, curl_message)
             code = error.code
             body = None
             effective_url = None
+            buffer.close()
+            buffer = None
         else:
             error = None
             code = curl.getinfo(pycurl.HTTP_CODE)
-            body = info["buffer"].getvalue()
             effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
-        info["buffer"].close()
+            buffer.seek(0)
         info["callback"](HTTPResponse(
             request=info["request"], code=code, headers=info["headers"],
-            body=body, effective_url=effective_url, error=error,
+            buffer=buffer, effective_url=effective_url, error=error,
             request_time=time.time() - info["start_time"]))
 
 
@@ -278,7 +299,8 @@ class HTTPRequest(object):
                  if_modified_since=None, follow_redirects=True,
                  max_redirects=5, user_agent=None, use_gzip=True,
                  network_interface=None, streaming_callback=None,
-                 header_callback=None, prepare_curl_callback=None):
+                 header_callback=None, prepare_curl_callback=None,
+                 allow_nonstandard_methods=False):
         if if_modified_since:
             timestamp = calendar.timegm(if_modified_since.utctimetuple())
             headers["If-Modified-Since"] = email.utils.formatdate(
@@ -301,15 +323,17 @@ class HTTPRequest(object):
         self.streaming_callback = streaming_callback
         self.header_callback = header_callback
         self.prepare_curl_callback = prepare_curl_callback
+        self.allow_nonstandard_methods = allow_nonstandard_methods
 
 
 class HTTPResponse(object):
-    def __init__(self, request, code, headers={}, body="", effective_url=None,
+    def __init__(self, request, code, headers={}, buffer=None, effective_url=None,
                  error=None, request_time=None):
         self.request = request
         self.code = code
         self.headers = headers
-        self.body = body
+        self.buffer = buffer
+        self._body = None
         if effective_url is None:
             self.effective_url = request.url
         else:
@@ -323,6 +347,16 @@ class HTTPResponse(object):
             self.error = error
         self.request_time = request_time
 
+    def _get_body(self):
+        if self.buffer is None:
+            return None
+        elif self._body is None:
+            self._body = self.buffer.getvalue()
+
+        return self._body
+
+    body = property(_get_body)
+
     def rethrow(self):
         if self.error:
             raise self.error
@@ -330,6 +364,10 @@ class HTTPResponse(object):
     def __repr__(self):
         args = ",".join("%s=%r" % i for i in self.__dict__.iteritems())
         return "%s(%s)" % (self.__class__.__name__, args)
+
+    def __del__(self):
+        if self.buffer is not None:
+            self.buffer.close()
 
 
 class HTTPError(Exception):
@@ -358,15 +396,11 @@ def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.URL, request.url)
     curl.setopt(pycurl.HTTPHEADER,
                 ["%s: %s" % i for i in request.headers.iteritems()])
-    try:
-        if request.header_callback:
-            curl.setopt(pycurl.HEADERFUNCTION, request.header_callback)
-        else:
-            curl.setopt(pycurl.HEADERFUNCTION,
-                        functools.partial(_curl_header_callback, headers))
-    except:
-        # Old version of curl; response will not include headers
-        pass
+    if request.header_callback:
+        curl.setopt(pycurl.HEADERFUNCTION, request.header_callback)
+    else:
+        curl.setopt(pycurl.HEADERFUNCTION,
+                    lambda line: _curl_header_callback(headers, line))
     if request.streaming_callback:
         curl.setopt(pycurl.WRITEFUNCTION, request.streaming_callback)
     else:
@@ -400,7 +434,7 @@ def _curl_setup_request(curl, request, buffer, headers):
     if request.method in curl_options:
         curl.unsetopt(pycurl.CUSTOMREQUEST)
         curl.setopt(curl_options[request.method], True)
-    elif request.method in custom_methods:
+    elif request.allow_nonstandard_methods or request.method in custom_methods:
         curl.setopt(pycurl.CUSTOMREQUEST, request.method)
     else:
         raise KeyError('unknown method ' + request.method)
